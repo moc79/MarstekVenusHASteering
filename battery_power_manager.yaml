@@ -1,0 +1,245 @@
+blueprint:
+  name: Battery Power Distribution Controller
+  description: >
+    Manages charge/discharge of two batteries based on solar surplus and consumption,
+    ensuring balanced state of charge and limiting grid power usage.
+  domain: automation
+  input:
+    power_meter:
+      name: Power Meter Sensor
+      description: Sensor entity showing net power (negative = export)
+      selector:
+        entity:
+          domain: sensor
+    battery_1_soc:
+      name: Battery 1 SoC Sensor
+      selector:
+        entity:
+          domain: sensor
+    battery_2_soc:
+      name: Battery 2 SoC Sensor
+      selector:
+        entity:
+          domain: sensor
+    battery_1_mode:
+      name: Battery 1 Mode Selector
+      selector:
+        entity:
+          domain: select
+    battery_2_mode:
+      name: Battery 2 Mode Selector
+      selector:
+        entity:
+          domain: select
+    battery_1_charge:
+      name: Battery 1 Charge Power Setter
+      selector:
+        entity:
+          domain: number
+    battery_1_discharge:
+      name: Battery 1 Discharge Power Setter
+      selector:
+        entity:
+          domain: number
+    battery_2_charge:
+      name: Battery 2 Charge Power Setter
+      selector:
+        entity:
+          domain: number
+    battery_2_discharge:
+      name: Battery 2 Discharge Power Setter
+      selector:
+        entity:
+          domain: number
+    system_mode:
+      name: System Mode (input_text)
+      selector:
+        entity:
+          domain: input_text
+    last_change:
+      name: Last Mode Change Timestamp (input_datetime)
+      selector:
+        entity:
+          domain: input_datetime
+
+mode: single
+
+trigger:
+  - platform: time_pattern
+    seconds: "/10"
+
+variables:
+  net_power: "{{ states(power_meter) | float }}"
+  soc1: "{{ states(battery_1_soc) | float }}"
+  soc2: "{{ states(battery_2_soc) | float }}"
+  mode: "{{ states(system_mode) }}"
+  now_ts: "{{ as_timestamp(now()) }}"
+  last_ts: "{{ as_timestamp(states(last_change)) }}"
+  cooldown_elapsed: "{{ (now_ts - last_ts) > 60 }}"
+  min_soc: 11
+  max_power: 2500
+  diff: "{{ soc2 - soc1 }}"
+  frac1: "{{ 0.5 + (diff / 200) }}"
+  frac2: "{{ 1 - (0.5 + (diff / 200)) }}"
+
+condition: []
+
+action:
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ cooldown_elapsed }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ net_power <= -50 and (soc1 < 100 or soc2 < 100) }}"
+                sequence:
+                  - service: input_text.set_value
+                    target:
+                      entity_id: !input system_mode
+                    data:
+                      value: "charge"
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input last_change
+                    data:
+                      timestamp: "{{ now_ts }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ net_power > 0 and (soc1 > min_soc or soc2 > min_soc) }}"
+                sequence:
+                  - service: input_text.set_value
+                    target:
+                      entity_id: !input system_mode
+                    data:
+                      value: "discharge"
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input last_change
+                    data:
+                      timestamp: "{{ now_ts }}"
+              - conditions:
+                  - condition: template
+                    value_template: "{{ net_power > -50 and net_power <= 0 }}"
+                sequence:
+                  - service: input_text.set_value
+                    target:
+                      entity_id: !input system_mode
+                    data:
+                      value: "stop"
+                  - service: input_datetime.set_datetime
+                    target:
+                      entity_id: !input last_change
+                    data:
+                      timestamp: "{{ now_ts }}"
+
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ mode == 'charge' }}"
+        sequence:
+          - variables:
+              surplus: "{{ -1 * (net_power + 50) if net_power <= -50 else 0 }}"
+          - service: select.select_option
+            target:
+              entity_id: !input battery_1_mode
+            data:
+              option: "{{ 'charge' if soc1 < 100 else 'stop' }}"
+          - service: select.select_option
+            target:
+              entity_id: !input battery_2_mode
+            data:
+              option: "{{ 'charge' if soc2 < 100 else 'stop' }}"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_1_charge
+            data:
+              value: "{{ ([surplus * frac1, max_power] | min) | int if soc1 < 100 else 0 }}"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_2_charge
+            data:
+              value: "{{ ([surplus * frac2, max_power] | min) | int if soc2 < 100 else 0 }}"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_1_discharge
+            data:
+              value: 0
+          - service: number.set_value
+            target:
+              entity_id: !input battery_2_discharge
+            data:
+              value: 0
+
+      - conditions:
+          - condition: template
+            value_template: "{{ mode == 'discharge' }}"
+        sequence:
+          - variables:
+              demand: "{{ net_power }}"
+          - service: select.select_option
+            target:
+              entity_id: !input battery_1_mode
+            data:
+              option: "{{ 'discharge' if soc1 > min_soc else 'stop' }}"
+          - service: select.select_option
+            target:
+              entity_id: !input battery_2_mode
+            data:
+              option: "{{ 'discharge' if soc2 > min_soc else 'stop' }}"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_1_discharge
+            data:
+              value: "{{ ([demand * frac1, max_power] | min) | int if soc1 > min_soc else 0 }}"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_2_discharge
+            data:
+              value: "{{ ([demand * frac2, max_power] | min) | int if soc2 > min_soc else 0 }}"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_1_charge
+            data:
+              value: 0
+          - service: number.set_value
+            target:
+              entity_id: !input battery_2_charge
+            data:
+              value: 0
+
+      - conditions:
+          - condition: template
+            value_template: "{{ mode == 'stop' }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input battery_1_mode
+            data:
+              option: "stop"
+          - service: select.select_option
+            target:
+              entity_id: !input battery_2_mode
+            data:
+              option: "stop"
+          - service: number.set_value
+            target:
+              entity_id: !input battery_1_charge
+            data:
+              value: 0
+          - service: number.set_value
+            target:
+              entity_id: !input battery_1_discharge
+            data:
+              value: 0
+          - service: number.set_value
+            target:
+              entity_id: !input battery_2_charge
+            data:
+              value: 0
+          - service: number.set_value
+            target:
+              entity_id: !input battery_2_discharge
+            data:
+              value: 0

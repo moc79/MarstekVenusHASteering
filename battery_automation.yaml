@@ -1,0 +1,137 @@
+# File: battery_automation.yaml
+# Place this file in your 'automations/' folder
+# Make sure your configuration.yaml includes:
+# automation: !include_dir_merge_list automations/
+
+- id: battery_mode_controller
+  alias: "Battery System Mode Controller"
+  trigger:
+    - platform: time_pattern
+      minutes: "/1"
+    - platform: state
+      entity_id: sensor.power_meter
+  condition: []
+  action:
+    - variables:
+        net_power: "{{ states('sensor.power_meter') | float }}"
+        soc1: "{{ states('sensor.battery_1_soc') | float }}"
+        soc2: "{{ states('sensor.battery_2_soc') | float }}"
+        now_ts: "{{ as_timestamp(now()) }}"
+        last_ts: "{{ as_timestamp(states('input_datetime.battery_last_change')) }}"
+        cooldown_elapsed: "{{ (now_ts - last_ts) > 60 }}"
+        current_mode: "{{ states('input_text.battery_system_mode') }}"
+        start_charge: "{{ net_power <= -50 and (soc1 < 100 or soc2 < 100) }}"
+        start_discharge: "{{ net_power > 0 and (soc1 > 11 or soc2 > 11) }}"
+        stop_conditions: "{{ net_power > -50 and net_power <= 0 }}"
+        new_mode: >
+          {% if cooldown_elapsed %}
+            {% if start_charge %}charge
+            {% elif start_discharge %}discharge
+            {% elif stop_conditions %}stop
+            {% else %}stop{% endif %}
+          {% else %}{{ current_mode }}{% endif %}
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ new_mode != current_mode }}"
+          sequence:
+            - service: input_text.set_value
+              target:
+                entity_id: input_text.battery_system_mode
+              data:
+                value: "{{ new_mode }}"
+            - service: input_datetime.set_datetime
+              target:
+                entity_id: input_datetime.battery_last_change
+              data:
+                timestamp: "{{ now_ts }}"
+
+- id: battery_power_adjustment
+  alias: "Battery Power Adjustment Dispatcher"
+  trigger:
+    - platform: time_pattern
+      seconds: "/10"
+  condition: []
+  action:
+    - variables:
+        max_power: 2500
+        min_soc: 11
+        net_power: "{{ states('sensor.power_meter') | float }}"
+        soc1: "{{ states('sensor.battery_1_soc') | float }}"
+        soc2: "{{ states('sensor.battery_2_soc') | float }}"
+        mode: "{{ states('input_text.battery_system_mode') }}"
+        diff: "{{ soc2 - soc1 }}"
+        frac1: "{{ 0.5 + (diff / 200) }}"
+        frac2: "{{ 1 - (0.5 + (diff / 200)) }}"
+        power1: 0
+        power2: 0
+    - choose:
+        - conditions:
+            - condition: template
+              value_template: "{{ mode == 'charge' }}"
+          sequence:
+            - variables:
+                surplus_power: "{{ -1 * (net_power + 50) if net_power <= -50 else 0 }}"
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ soc1 < 100 and soc2 < 100 }}"
+                  sequence:
+                    - variables:
+                        power1: "{{ [surplus_power * frac1 | float, max_power] | min }}"
+                        power2: "{{ [surplus_power * frac2 | float, max_power] | min }}"
+                - conditions:
+                    - condition: template
+                      value_template: "{{ soc1 < 100 and soc2 >= 100 }}"
+                  sequence:
+                    - variables:
+                        power1: "{{ [surplus_power, max_power] | min }}"
+                - conditions:
+                    - condition: template
+                      value_template: "{{ soc2 < 100 and soc1 >= 100 }}"
+                  sequence:
+                    - variables:
+                        power2: "{{ [surplus_power, max_power] | min }}"
+        - conditions:
+            - condition: template
+              value_template: "{{ mode == 'discharge' }}"
+          sequence:
+            - variables:
+                demand: "{{ net_power }}"
+            - choose:
+                - conditions:
+                    - condition: template
+                      value_template: "{{ soc1 > min_soc and soc2 > min_soc }}"
+                  sequence:
+                    - variables:
+                        power1: "{{ [demand * frac1 | float, max_power] | min }}"
+                        power2: "{{ [demand * frac2 | float, max_power] | min }}"
+                - conditions:
+                    - condition: template
+                      value_template: "{{ soc1 > min_soc and soc2 <= min_soc }}"
+                  sequence:
+                    - variables:
+                        power1: "{{ [demand, max_power] | min }}"
+                - conditions:
+                    - condition: template
+                      value_template: "{{ soc2 > min_soc and soc1 <= min_soc }}"
+                  sequence:
+                    - variables:
+                        power2: "{{ [demand, max_power] | min }}"
+    - service: input_text.set_value
+      target:
+        entity_id:
+          - input_text.battery_1_mode
+          - input_text.battery_2_mode
+      data:
+        value: "{{ mode }}"
+    - service: input_number.set_value
+      data:
+        value: "{{ power1 | round(0) }}"
+      target:
+        entity_id: input_number.battery_1_power
+    - service: input_number.set_value
+      data:
+        value: "{{ power2 | round(0) }}"
+      target:
+        entity_id: input_number.battery_2_power
