@@ -1,28 +1,38 @@
-# File: battery_automation.yaml
-# Place this file in your 'automations/' folder
-# Make sure your configuration.yaml includes:
-# automation: !include_dir_merge_list automations/
+# -------------------------------------------------
+# Battery automation – controls system mode (charge / discharge / stop)
+# and distributes power between two batteries based on state‑of‑charge (SOC)
+# and the net power measured on `sensor.power_meter`.
+# -------------------------------------------------
 
 - id: battery_mode_controller
   alias: "Battery System Mode Controller"
+  # Runs every minute **and** whenever the power meter changes.
   trigger:
     - platform: time_pattern
-      minutes: "/1"
+      minutes: "/1"                       # every minute
     - platform: state
-      entity_id: sensor.power_meter
-  condition: []
+      entity_id: sensor.power_meter       # on power changes
+  condition: []                           # no extra conditions
   action:
     - variables:
+        # Current power flow (positive = consumption, negative = export)
         net_power: "{{ states('sensor.power_meter') | float }}"
+        # State‑of‑charge of each battery (0‑100 %)
         soc1: "{{ states('sensor.battery_1_soc') | float }}"
         soc2: "{{ states('sensor.battery_2_soc') | float }}"
+        # Timestamps for cooldown handling
         now_ts: "{{ as_timestamp(now()) }}"
         last_ts: "{{ as_timestamp(states('input_datetime.battery_last_change')) }}"
+        # Ensure we don’t switch modes too often (1 min cooldown)
         cooldown_elapsed: "{{ (now_ts - last_ts) > 60 }}"
+        # Current operating mode (stored in an input_text helper)
         current_mode: "{{ states('input_text.battery_system_mode') }}"
+        # Decide whether we should start charging or discharging
         start_charge: "{{ net_power <= -50 and (soc1 < 100 or soc2 < 100) }}"
         start_discharge: "{{ net_power > 0 and (soc1 > 11 or soc2 > 11) }}"
+        # Conditions that tell us to stop any active mode
         stop_conditions: "{{ net_power > -50 and net_power <= 0 }}"
+        # Determine the new mode, respecting the cooldown timer
         new_mode: >
           {% if cooldown_elapsed %}
             {% if start_charge %}charge
@@ -30,16 +40,19 @@
             {% elif stop_conditions %}stop
             {% else %}stop{% endif %}
           {% else %}{{ current_mode }}{% endif %}
+    # Only act when the mode actually changes
     - choose:
         - conditions:
             - condition: template
               value_template: "{{ new_mode != current_mode }}"
           sequence:
+            # Update the mode helper
             - service: input_text.set_value
               target:
                 entity_id: input_text.battery_system_mode
               data:
                 value: "{{ new_mode }}"
+            # Record the time of this change (used for cooldown)
             - service: input_datetime.set_datetime
               target:
                 entity_id: input_datetime.battery_last_change
@@ -48,31 +61,37 @@
 
 - id: battery_power_adjustment
   alias: "Battery Power Adjustment Dispatcher"
+  # Runs every 10 seconds to keep power set‑points up‑to‑date.
   trigger:
     - platform: time_pattern
       seconds: "/10"
-  condition: []
+  condition: []                           # no extra conditions
   action:
     - variables:
-        max_power: 2500
-        min_soc: 11
+        max_power: 2500                    # maximum power we allow per battery (W)
+        min_soc: 11                        # SOC below which we never discharge
         net_power: "{{ states('sensor.power_meter') | float }}"
         soc1: "{{ states('sensor.battery_1_soc') | float }}"
         soc2: "{{ states('sensor.battery_2_soc') | float }}"
         mode: "{{ states('input_text.battery_system_mode') }}"
+        # Balance factor based on the difference between the two SOCs
         diff: "{{ soc2 - soc1 }}"
-        frac1: "{{ 0.5 + (diff / 200) }}"
-        frac2: "{{ 1 - (0.5 + (diff / 200)) }}"
+        frac1: "{{ 0.5 + (diff / 200) }}"   # proportion for battery 1
+        frac2: "{{ 1 - (0.5 + (diff / 200)) }}" # proportion for battery 2
         power1: 0
         power2: 0
+    # ----- Choose power set‑points based on the current mode -----
     - choose:
+        # ---- Charging mode -------------------------------------------------
         - conditions:
             - condition: template
               value_template: "{{ mode == 'charge' }}"
           sequence:
             - variables:
+                # Surplus power we can store (add 50 W buffer)
                 surplus_power: "{{ -1 * (net_power + 50) if net_power <= -50 else 0 }}"
             - choose:
+                # Both batteries need charging
                 - conditions:
                     - condition: template
                       value_template: "{{ soc1 < 100 and soc2 < 100 }}"
@@ -80,25 +99,29 @@
                     - variables:
                         power1: "{{ [surplus_power * frac1 | float, max_power] | min }}"
                         power2: "{{ [surplus_power * frac2 | float, max_power] | min }}"
+                # Only battery 1 needs charging
                 - conditions:
                     - condition: template
                       value_template: "{{ soc1 < 100 and soc2 >= 100 }}"
                   sequence:
                     - variables:
                         power1: "{{ [surplus_power, max_power] | min }}"
+                # Only battery 2 needs charging
                 - conditions:
                     - condition: template
                       value_template: "{{ soc2 < 100 and soc1 >= 100 }}"
                   sequence:
                     - variables:
                         power2: "{{ [surplus_power, max_power] | min }}"
+        # ---- Discharging mode -----------------------------------------------
         - conditions:
             - condition: template
               value_template: "{{ mode == 'discharge' }}"
           sequence:
             - variables:
-                demand: "{{ net_power }}"
+                demand: "{{ net_power }}"   # power we need to supply
             - choose:
+                # Both batteries have enough SOC to discharge
                 - conditions:
                     - condition: template
                       value_template: "{{ soc1 > min_soc and soc2 > min_soc }}"
@@ -106,32 +129,35 @@
                     - variables:
                         power1: "{{ [demand * frac1 | float, max_power] | min }}"
                         power2: "{{ [demand * frac2 | float, max_power] | min }}"
+                # Only battery 1 can discharge
                 - conditions:
                     - condition: template
                       value_template: "{{ soc1 > min_soc and soc2 <= min_soc }}"
                   sequence:
                     - variables:
                         power1: "{{ [demand, max_power] | min }}"
+                # Only battery 2 can discharge
                 - conditions:
                     - condition: template
                       value_template: "{{ soc2 > min_soc and soc1 <= min_soc }}"
                   sequence:
                     - variables:
                         power2: "{{ [demand, max_power] | min }}"
+    # ----- Push the calculated values back to helpers -----------------
     - service: input_text.set_value
       target:
         entity_id:
           - input_text.battery_1_mode
           - input_text.battery_2_mode
       data:
-        value: "{{ mode }}"
+        value: "{{ mode }}"                # both batteries share the same mode
     - service: input_number.set_value
       data:
-        value: "{{ power1 | round(0) }}"
+        value: "{{ power1 | round(0) }}"   # power set‑point for battery 1 (W)
       target:
         entity_id: input_number.battery_1_power
     - service: input_number.set_value
       data:
-        value: "{{ power2 | round(0) }}"
+        value: "{{ power2 | round(0) }}"   # power set‑point for battery 2 (W)
       target:
         entity_id: input_number.battery_2_power
